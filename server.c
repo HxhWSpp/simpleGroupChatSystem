@@ -5,10 +5,10 @@
 #include <string.h>
 #include <arpa/inet.h> 
 #include <unistd.h>
-//#include <pthread.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <signal.h>
 
 #define DEFAULT_PORT "9813"
 
@@ -36,6 +36,7 @@ enum MSG_TYPE{
     CLIENT_JOINED_GROUPS,
     CLIENT_OWNED_GROUPS,
     SERVER_MSG,
+    GROUP_INFO
 };
 
 
@@ -71,7 +72,7 @@ int hash(int key)
   key = key ^ (key >> 4);
   key = key * c2;
   key = key ^ (key >> 15);
-  return key % 1024;
+  return key % TABLE_SIZE;
 }
 
 
@@ -81,63 +82,64 @@ void del_from_pfds(struct pollfd pfds[], int i, int *fd_count);
 
 int add_client(Client clients[] , unsigned char s_buffer[] , int sender_fd , int msg_lenght);
 Client* find_client(Client clients[] , int sender_fd);
-void change_client_name(Client *client ,unsigned char s_buffer[] ,  int msg_lenght);
 int delete_client(Client clients[] , int sender_fd);
 
 int get_all_groups(Group groups[] , unsigned char buffer[]);
 int create_group(Group groups[] , int *g_count , Client *group_owner, char group_name[]);
 int join_group(Group groups[] , Client *new_member , int group_id);
 int leave_group(Group groups[] , Client *member , int group_id);
-int remove_group(Group groups[] , int *g_count , int group_id , int owner_fd);
-void group_info(Group groups[] , int group_id);
+int remove_group(Group groups[] , int group_id  , int sender_fd);
+int group_info(Group groups[] , int group_id , unsigned char buffer[]);
 Group* find_group(Group clients[] , int group_id);
 
 
 enum MSG_TYPE deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[] , int  *msg_lenght);
 int serialize_msg(unsigned char *buffer , enum MSG_TYPE msg_type, char msg[] , char sender[] , int *msg_lenght);
 
+volatile sig_atomic_t running = 1; 
+
+void handle_signal(int sig) 
+{
+    running = 0;
+}
 
 int main(int argc , char *argv[])
 {
    
     int client_socket , listener;
     int sbytes , rbytes;
+
     struct sockaddr_storage connecting_addr;
 
     struct addrinfo hints;
     struct addrinfo *servinfo;  
-    
+
+
     memset(&hints, 0, sizeof(hints)); 
     hints.ai_family = AF_UNSPEC;     
     hints.ai_socktype = SOCK_STREAM; 
     hints.ai_flags = AI_PASSIVE;
 
-    //alocate enough for the server ip and '\0'    
-    char* server_ip = malloc(INET_ADDRSTRLEN);
-    char* server_port = malloc(INET_ADDRSTRLEN);    
 
+
+    char* server_port = malloc(INET_ADDRSTRLEN);    
 
     if (argc == 1 )
     {   
-        strcpy(server_port ,DEFAULT_PORT);        
-        //server_port = default_port;
+        strcpy(server_port ,DEFAULT_PORT);              
     }
     else
     {
         strcpy(server_port ,argv[1]);
     }
    
-         
-    //get hostname of local machine
-    char ip[INET_ADDRSTRLEN];
-    gethostname(ip, INET_ADDRSTRLEN);
-
 
     if(getaddrinfo(NULL, server_port, &hints, &servinfo) != 0 ){
-        printf("[ERROR] couldn't get address info for %s:%s\n" , server_ip , server_port);
+        printf("[ERROR] couldn't get address info for 127.0.0.1:%s\n" , server_port);
         return 1;
     } 
 
+    //set listener to the socket descriptor that socket() returns
     listener = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
     if (listener == -1)
     {
@@ -150,9 +152,10 @@ int main(int argc , char *argv[])
     int yes =1;
     setsockopt(listener,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof yes);
 
-
+    //bind the socket descriptor on a port so we can call listen() later 
     bind(listener, servinfo->ai_addr, servinfo->ai_addrlen);
 
+    //makes the socket descriptor accept connections
     if(listen(listener , 20) == -1)
     {
         printf("[ERROR] couldn't prepare to accept connections on socket %d\n" , listener);
@@ -161,6 +164,8 @@ int main(int argc , char *argv[])
 
     printf("Listening on :%s\n"  , server_port);  
       
+
+    //create a dynamic array to put the accepted socket descriptors in and poll them for data
     int fd_count = 1;
     int fd_size = 100;
     struct pollfd *pfds = malloc(fd_size * sizeof(struct pollfd));
@@ -168,6 +173,7 @@ int main(int argc , char *argv[])
     pfds[0].events = POLLIN;
 
 
+    //create a hash table for clients , we will use fd as a key
     Client clientsTable[TABLE_SIZE];
     for (size_t i = 0; i < TABLE_SIZE; i++)
     {
@@ -175,7 +181,7 @@ int main(int argc , char *argv[])
         clientsTable[i].next_client = NULL;
     }
     
- 
+    //create a hash table for gorups , we will use g_count as a key
     int g_count = 0;
     Group groups[TABLE_SIZE];      
     for (size_t i = 0; i < TABLE_SIZE; i++)
@@ -184,16 +190,28 @@ int main(int argc , char *argv[])
         groups[i].next_group = NULL;
     }  
     
+
     Client *sender_client;
+
     int buffer_size = 0;
     int msg_lenght = 0;
-    int result = 0;      
+
+    int result = 0;  
+
     unsigned char r_buffer[256];
     unsigned char s_buffer[256];
+
+    //when ctrl+c is detected it calls handle_signal;
+    signal(SIGINT, handle_signal);
    
 
-    while(1){        
+    while(1){    
+        if (running == 0)
+        {
+            break;  
+        }   
         
+        //poll the sockets for data
         int poll_count = poll(pfds, fd_count, -1);
 
         for (size_t i = 0; i < fd_count; i++)
@@ -201,7 +219,8 @@ int main(int argc , char *argv[])
            if (pfds[i].revents & POLLIN == 1) 
            {               
                 if (pfds[i].fd == listener)               
-                {                                                                                    
+                {      
+                    //if the listener socket has data , it means that a client wants to connect                                                                              
                     socklen_t addr_size = sizeof connecting_addr;
                     client_socket = accept(listener, (struct sockaddr *)&connecting_addr, &addr_size);                 
                     if (client_socket != -1)
@@ -213,38 +232,56 @@ int main(int argc , char *argv[])
                     }                                                                                                                                                                    
                 }
                 else
-                {                                                                 
+                {     
+                    //a client has sent data to us                                                            
                     rbytes = recv(pfds[i].fd, r_buffer, sizeof(r_buffer), 0);
                                                     
                     int sender_fd = pfds[i].fd;
 
                     if (rbytes <= 0) {
+                        //if received bytes is <= 0 , it means that a client has disconected
+                        sender_client = find_client(clientsTable, sender_fd);
 
-                       close(pfds[i].fd);  
+            
+                        close(pfds[i].fd);  
 
-                       del_from_pfds(pfds, i, &fd_count);
-                       result = delete_client(clientsTable, sender_fd);
-                       if (result == 0)
-                       {
 
-                       }
+                        //find the client in the hash table and clean after him . (leave groups he is in , remove groups he is a owner to)
+                        sender_client = find_client(clientsTable , sender_fd);
+
+                        for (size_t v = sender_client->joined_groups_count; v > 0; v--)
+                        {
+                            leave_group(groups , sender_client ,sender_client->joined_groups[v - 1]);
+                        }
+
+                        for (size_t o = sender_client->owned_groups_count; o > 0; o--)
+                        {
+                            remove_group(groups , sender_client->owned_groups[o - 1] , sender_client->fd);
+                        }                     
+                        
+
+                        del_from_pfds(pfds, i, &fd_count);
+                        
+                        //delete client from the hash table
+                        result = delete_client(clientsTable, sender_fd);                      
                                                                  
 
                     } 
                     else 
-                    {                      
+                    {     
+
                         enum MSG_TYPE msg_type = deserialize_msg(r_buffer , s_buffer , &msg_lenght); 
-                        printf("%d\n" , msg_type);
-                        //printf("buffer is %s , msg-len is %d\n" , s_buffer , msg_lenght);
+                        
                         switch (msg_type)
                         {
                         case REG:  
-
+                            //add a client to the hash table with user_name
                             result = add_client(clientsTable , s_buffer , sender_fd , msg_lenght);
                             printf("Client added to hash table at %d\n" , result);
                             
                             break;
                         case JOIN_GROUP:
+                            //extract the sent id for the buffer and parse it to int
                             char id_to_join[4];
                             strncpy(id_to_join , s_buffer , msg_lenght);                          
                             int g_join = atoi(id_to_join);
@@ -258,11 +295,13 @@ int main(int argc , char *argv[])
                             }
                             else
                             {
+                                //construct a reposnse msg and send it to the client
                                 char group_joined[52];
                                 memset(group_joined , '\0' , sizeof(group_joined));
                                 sprintf(group_joined, "Successfully joined group with id %d", result);
                                 int group_joined_len = strlen(group_joined);
                                 buffer_size = serialize_msg(r_buffer , SERVER_MSG , group_joined , sender_client->user_name , &group_joined_len);
+                                sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);
                             }
                                                            
                                                               
@@ -270,6 +309,8 @@ int main(int argc , char *argv[])
                         case CLIENT_JOINED_GROUPS:
                                 sender_client = find_client(clientsTable , sender_fd);   
                                 
+
+                                //find client and construct a msg with a list of groups that he is in
                                 if (sender_client->joined_groups_count != 0)
                                 {                              
                                     char joined_groups[MAX_JOINED_GROUPS * MAX_GROUP_NAME];
@@ -281,7 +322,7 @@ int main(int argc , char *argv[])
                                     for (int n = 0; n < sender_client->joined_groups_count; n++)
                                     {                                                              
                                         Group *g = find_group(groups ,sender_client->joined_groups[n]);
-                                        //printf("found g %s\n" , g->group_name);
+                                
                                         strncpy(joined_groups + cursor , g->group_name , strlen(g->group_name));
                                         cursor += strlen(g->group_name);
                                                                                         
@@ -296,48 +337,104 @@ int main(int argc , char *argv[])
                                     
                                     buffer_size = serialize_msg(r_buffer , SERVER_MSG , joined_groups , sender_client->user_name , &cursor);
                                     sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);
-                                    //printf("%s\n" , owned_groups);
-                                    //printf( "%d\n", cursor);
-                                    memset(joined_groups , '\0' , cursor + 1);
+                                                                    
+                                }
+                                else
+                                {
+                                    //construct a reposnse msg and send it to the client
+                                    char chat_warn[] = "You are not in any groups";
+                                    int warn_len = sizeof(chat_warn);
+                                    buffer_size = serialize_msg(r_buffer , SERVER_MSG , chat_warn , sender_client->user_name , &warn_len);
+                                    sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);
                                 }
                             break;
                         case LEAVE_GROUP:
+                                //extract group id for the buffer and parse it to int
                                 char id_to_leave[4];
                                 strncpy(id_to_leave , s_buffer , msg_lenght);
                                
                                 int g_leave = atoi(id_to_leave);
                                 
                                 sender_client = find_client(clientsTable , sender_fd);
-                                result = leave_group(groups , sender_client , g_leave);                                                      
+
+                                int owned = 0;
+                                int joined = 0;
+
+                                //check if he owns the group he is trying to leave
+                                for (size_t h = 0; h < sender_client->owned_groups_count; h++)
+                                {
+                                    if (sender_client->owned_groups[h] == g_leave)
+                                    {
+                                        owned = 1;
+                                        break;
+                                    }
+                                    
+                                }
+                                
+                                //check if he is in the group he is trying to leave
+                                for (size_t g = 0; g < sender_client->owned_groups_count; g++)
+                                {
+                                    if (sender_client->joined_groups[g] == g_leave)
+                                    {
+                                        joined = 1;
+                                        break;
+                                    }
+                                }
+
+                                if (joined == 1 && owned != 1)
+                                {
+                                    result = leave_group(groups , sender_client , g_leave);
+                                }
+                                else
+                                {
+                                    //construct a reposnse msg and send it to the client
+                                    char server_warn[] = "You either own the group you are trying to leave or arent in it";
+                                    int warn_len = sizeof(server_warn);
+                                    buffer_size = serialize_msg(r_buffer , SERVER_MSG , server_warn , sender_client->user_name , &warn_len);
+                                    sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);
+                                }
+                                
+                                 
+
                             break;
                         case CHAT_JOIN:
-
+                            //extract the group id the client is trying to chat with and parse it to int
                             char id_to_chat[4];
                             strncpy(id_to_chat , s_buffer , msg_lenght);
                             int chat_join = atoi(id_to_chat);
     
                             sender_client = find_client(clientsTable , sender_fd);
                             if (sender_client->chat_group_id == -1)
-                            {
+                            {                               
                                 for (size_t m = 0; m < sender_client->joined_groups_count; m++)
                                 {
                                     if (sender_client->joined_groups[m] == chat_join)
-                                    {
+                                    {                                      
                                         sender_client->chat_group_id = chat_join;
                                         break;
                                     }                                    
                                 }                               
                             }
+                            else
+                            {
+                                //construct a reposnse msg and send it to the client
+                                char server_warn[] = "You are already in a chat";
+                                int warn_len = sizeof(server_warn);
+                                buffer_size = serialize_msg(r_buffer , SERVER_MSG , server_warn , sender_client->user_name , &warn_len);
+                                sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);
+                            }
                             
                             
 
                             break;
-                        case CHAT_LEAVE:                          
+                        case CHAT_LEAVE: 
+                            //if the client wants to leave a chat just set chat_group_id to -1
                             sender_client = find_client(clientsTable , sender_fd);
                             sender_client->chat_group_id = -1;
 
                             break;
                         case CREATE_GROUP:
+                            //create a group with name and save it to the group hash table
                             sender_client = find_client(clientsTable , sender_fd);                          
 
                             if (sender_client->owned_groups_count != MAX_OWNED_GROUPS)
@@ -359,6 +456,7 @@ int main(int argc , char *argv[])
                             }
                             else
                             {
+                                //construct a reposnse msg and send it to the client
                                 char group_warn[] = "You've reached the max number of owned groups for a client";
                                 int warn_len = sizeof(group_warn);
                                 buffer_size = serialize_msg(r_buffer , SERVER_MSG , group_warn , sender_client->user_name , &warn_len);
@@ -367,7 +465,7 @@ int main(int argc , char *argv[])
 
                             break;
                         case CLIENT_OWNED_GROUPS:
-                           
+                            //find client and construct a msg with a list of groups that he owns
                             sender_client = find_client(clientsTable , sender_fd);   
                             if (sender_client->owned_groups_count != 0)
                             {                              
@@ -379,8 +477,7 @@ int main(int argc , char *argv[])
 
                                 for (int n = 0; n < sender_client->owned_groups_count; n++)
                                 {                                                              
-                                    Group *g = find_group(groups ,sender_client->owned_groups[n]);
-                                    printf("found g %s\n" , g->group_name);
+                                    Group *g = find_group(groups ,sender_client->owned_groups[n]);                                  
                                     strncpy(owned_groups + cursor , g->group_name , strlen(g->group_name));
                                     cursor += strlen(g->group_name);
                                                                                     
@@ -394,13 +491,12 @@ int main(int argc , char *argv[])
 
                                 
                                 buffer_size = serialize_msg(r_buffer , SERVER_MSG , owned_groups , sender_client->user_name , &cursor);
-                                sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);
-                                //printf("%s\n" , owned_groups);
-                                //printf( "%d\n", cursor);
+                                sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);                             
                                 memset(owned_groups , '\0' , cursor + 1);
                             }
                             else
                             {
+                                //construct a reposnse msg and send it to the client
                                 char chat_warn[] = "You dont own any groups";
                                 int warn_len = sizeof(chat_warn);
                                 buffer_size = serialize_msg(r_buffer , SERVER_MSG , chat_warn , sender_client->user_name , &warn_len);
@@ -408,20 +504,35 @@ int main(int argc , char *argv[])
                             }  
                                                                                                                                                                                      
                             break;
-                        case CHANGE_NAME:
-                            
+                        case GROUP_INFO:
+                            //extract the group id and construct a msg with the group's info (name , owner , members) and send it to the client
+                            sender_client = find_client(clientsTable, sender_fd);
+                            char g_info[4];
+                            strncpy(g_info , s_buffer , msg_lenght);
+                            int group_info_id = atoi(g_info);
 
+                            char group_info_buffer[1024];
+
+                            result = group_info(groups , group_info_id , group_info_buffer);
+                            if (result != -1)
+                            {
+                                buffer_size = serialize_msg(r_buffer , SERVER_MSG , group_info_buffer , sender_client->user_name , &result);
+                                sbytes = send(sender_client->fd ,r_buffer , buffer_size , 0);
+                            }
+                            
                             break;
-                        case GROUP_QUERY:                         
-                            int len = get_all_groups(groups , s_buffer);
-                            //printf("%s" , s_buffer);
-                            buffer_size = serialize_msg(r_buffer , SERVER_MSG , s_buffer , sender_client->user_name , &len);
-                            sbytes = send(pfds[i].fd ,r_buffer , buffer_size , 0);
+                        case GROUP_QUERY: 
+                            //construct a msg with a list of all groups (GROUP_NAME - ID)                        
+                            result = get_all_groups(groups , s_buffer);
+
+                            buffer_size = serialize_msg(r_buffer , SERVER_MSG , s_buffer , sender_client->user_name , &result);
+                            sbytes = send(sender_fd ,r_buffer , buffer_size , 0);
                             
                             
                             break;
                         case MSG: 
-                            
+                            //a normal chat msg
+                            //check if the client is in a group chat and send the msg to the group
                             sender_client = find_client(clientsTable , sender_fd);
                             if (sender_client->chat_group_id != -1)
                             {
@@ -437,6 +548,7 @@ int main(int argc , char *argv[])
                             } 
                             else
                             {
+                                //construct a reposnse msg and send it to the client
                                 char chat_warn[] = "You are not in a chat";
                                 int warn_len = sizeof(chat_warn);
                                 buffer_size = serialize_msg(r_buffer , SERVER_MSG , chat_warn , sender_client->user_name , &warn_len);
@@ -444,12 +556,12 @@ int main(int argc , char *argv[])
                             }                                                                                                                                                    
                             break;
                         case REMOVE_GROUP:
-                           
+                           //extract the group id from the buffer and parse it to int
                             char id_to_remove[100];
                             strncpy(id_to_remove , s_buffer , msg_lenght);
                             int g_remove = atoi(id_to_remove);                           
                                           
-                            remove_group(groups , &g_count , g_remove , sender_fd);
+                            remove_group(groups , g_remove , sender_fd);
                             
                             break;
                         
@@ -464,8 +576,17 @@ int main(int argc , char *argv[])
 
     }
        
+
+    printf("Closing client sockets socket\n");
+    for (size_t i = 0; i < fd_count; i++)
+    {
+        close(pfds[i].fd);
+    }
+    
+    close(listener);
 }
 
+//serialize a msg and send it to the client
 int serialize_msg(unsigned char *buffer , enum MSG_TYPE msg_type, char msg[] , char sender[] , int *msg_lenght)
 {
     int cursor = 0;
@@ -487,6 +608,7 @@ int serialize_msg(unsigned char *buffer , enum MSG_TYPE msg_type, char msg[] , c
     return cursor;
 }
 
+//deserialize a msg sent from the client
 enum MSG_TYPE deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[] , int *msg_lenght)
 {
     int cursor = 0;
@@ -505,9 +627,10 @@ enum MSG_TYPE deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[
 
 }
 
+//add a fd to the dynamic array
 void add_fd(struct pollfd *pfds[], int newfd, int *fd_count, int *fd_size)
 {
-    // If we don't have room, add more space in the pfds array
+    // if we don't have room, add more space in the pfds array
     if (*fd_count == *fd_size) {
         *fd_size *= 2;
 
@@ -520,14 +643,16 @@ void add_fd(struct pollfd *pfds[], int newfd, int *fd_count, int *fd_size)
     (*fd_count)++;
 }
 
+//delete a fd
 void del_from_pfds(struct pollfd pfds[], int i, int *fd_count)
 {
-    // Copy the one from the end over this one
     pfds[i] = pfds[*fd_count-1];
 
     (*fd_count)--;
 }
 
+
+//add client to the hash table
 int add_client(Client clients[] , unsigned char s_buffer[] , int sender_fd , int msg_lenght)
 {
     int index = hash(sender_fd);
@@ -544,11 +669,11 @@ int add_client(Client clients[] , unsigned char s_buffer[] , int sender_fd , int
     if (clients[index].fd == -1)
     {
         clients[index] = *client;
+        free(client); 
         return index;
     }
     else
     {
-        //printf("Found collision for %d , adding to %d's linked list\n" , sender_fd , index);
         Client *temp = &clients[index];
         while (temp->next_client != NULL) 
         {
@@ -560,6 +685,8 @@ int add_client(Client clients[] , unsigned char s_buffer[] , int sender_fd , int
      
 }
 
+
+//delete a client from the hash table
 int delete_client(Client clients[] , int sender_fd)
 {
     int index = hash(sender_fd);
@@ -568,7 +695,7 @@ int delete_client(Client clients[] , int sender_fd)
     Client *prev = NULL;
   
     if (curr->next_client == NULL)
-    {
+    {                 
         curr->fd = -1;
         memset(curr->user_name , '\0' , sizeof(curr->user_name));
         printf("There is no next_client at %d , just reset the fields\n" , index);
@@ -608,6 +735,7 @@ int delete_client(Client clients[] , int sender_fd)
     }          
 }
 
+//find client using sender_fd as a key
 Client* find_client(Client clients[] , int sender_fd)
 {
     int index = hash(sender_fd);
@@ -632,24 +760,15 @@ Client* find_client(Client clients[] , int sender_fd)
     
 }
 
-
-
-void change_client_name(Client *client ,unsigned char s_buffer[] ,  int msg_lenght)
-{
-    //clear old name
-    int name_len = strlen(client->user_name);
-    memset(client->user_name, '\0', name_len);
-    
-    //set new name
-    strncpy(client->user_name , s_buffer , msg_lenght);
-}
-
+//create a group using g_count as a key and set g_count a the newly created group's id
 int create_group(Group groups[] , int *g_count , Client *group_owner , char group_name[])
 {   
     int index = hash((*g_count));
    
     Group *group = malloc(sizeof(Group));
     group->id = *g_count;
+
+    //fill group
     group->owner = group_owner;  
     strcpy(group->group_name , group_name);
     
@@ -660,17 +779,14 @@ int create_group(Group groups[] , int *g_count , Client *group_owner , char grou
     }
     group->members[0] = group_owner;
     group->members_count++;
-
-    
+   
    
     if (groups[index].id == -1)
     {
         groups[index] = *group;
-        
     }
     else
     {
-        //printf("Found collision for %d , adding to %d's linked list\n" , (*g_count) , index);
         Group *temp = &groups[index];
         while (temp->next_group != NULL) 
         {
@@ -678,20 +794,24 @@ int create_group(Group groups[] , int *g_count , Client *group_owner , char grou
         }
         temp->next_group = group;        
     }
-    //printf("its over\n");
+
+    //add the group to the owner's owned_groups
     group_owner->owned_groups[group_owner->owned_groups_count] = group->id;
     group_owner->owned_groups_count++;
 
+    //add the group to the owner's joined_groups
     group_owner->joined_groups[group_owner->joined_groups_count] = group->id;
     group_owner->joined_groups_count++;
     (*g_count)++;
+
     return group->id;
 }
 
+
+//find group in the hash table
 Group* find_group(Group groups[] , int group_id)
 {
     int index = hash(group_id);
-    //printf("hashed %d\n" , index);
 
     Group *group = &groups[index];
     if (group->id == -1)
@@ -717,18 +837,46 @@ Group* find_group(Group groups[] , int group_id)
     }
 }
 
-int remove_group(Group groups[] , int *g_count , int group_id , int owner_fd)
+//when removing a group clean it up form the client's arrays
+void clean_group(Group *curr , Group groups[])
+{
+    for (int i = curr->members_count; i > 0; i--)
+    {
+        Client *c = curr->members[i - 1];                       
+        leave_group(groups , c , curr->id);                              
+    }
+
+    for (size_t i = 0; i < curr->owner->owned_groups_count; i++)
+    {
+        if (curr->owner->owned_groups[i] == curr->id)
+        {
+            curr->owner->owned_groups[i] = curr->owner->owned_groups[curr->owner->owned_groups_count - 1];
+            curr->owner->owned_groups[curr->owner->owned_groups_count - 1] = -1;
+            curr->owner->owned_groups_count--;
+            break;
+        }                           
+    }
+    
+}
+
+//remove group from the hash table
+int remove_group(Group groups[] , int group_id , int owner_fd)
 {  
     int index = hash(group_id);
 
     Group *curr = &groups[index];
     Group *prev = NULL;
-
   
     if (curr->next_group == NULL && curr->owner->fd == owner_fd && curr->id == group_id)
     {
+              
+        clean_group(curr , groups);
+        
         curr->id = -1;
         memset(curr->group_name , '\0' , sizeof(curr->group_name));
+        curr->owner = NULL;
+        
+
         printf("There is no next_group at %d , just reset the fields\n" , index);
         return 0;
     }
@@ -740,17 +888,23 @@ int remove_group(Group groups[] , int *g_count , int group_id , int owner_fd)
             {
                 if (prev == NULL)
                 {
-                    Group *next = curr->next_group;
+
+                    Group *next = curr->next_group;   
+
+                    clean_group(curr , groups);
+
                     *curr = *next;
-                    printf("There was a linked list at %d , deleted head\n" , index); 
-                    (*g_count)--;                
+                    printf("There was a linked list at %d , deleted head\n" , index);             
                     return 0;
                 }
                 
                 prev->next_group = curr->next_group;
+
+                clean_group(curr , groups);
+
                 free(curr);
                 printf("The Group was somewhare in the middle of the linked list at %d\n" , index);
-                (*g_count)--;
+                
                 return 0;             
             }
             prev = curr;
@@ -759,16 +913,21 @@ int remove_group(Group groups[] , int *g_count , int group_id , int owner_fd)
         if (curr->id == group_id && curr->owner->fd == owner_fd)
         {
             prev->next_group = curr->next_group;
+
+            clean_group(curr , groups);
+
             free(curr);
             printf("Group was the tail of the linked list at %d\n" , index);
-            (*g_count)--; 
+            
             return 0; 
         }
         printf("Could not delete group\n"); 
     }          
-    
+    return 1;
 }
 
+
+//join a group
 int join_group(Group groups[] ,  Client *new_member,  int group_id)
 {
     
@@ -778,7 +937,6 @@ int join_group(Group groups[] ,  Client *new_member,  int group_id)
         return 1;
     }
     
-
     new_member->joined_groups[new_member->joined_groups_count] = group_id;
     new_member->joined_groups_count++;
 
@@ -788,6 +946,8 @@ int join_group(Group groups[] ,  Client *new_member,  int group_id)
    
 }
 
+
+//leave a group
 int leave_group(Group groups[] , Client *member , int group_id)
 {
 
@@ -798,8 +958,6 @@ int leave_group(Group groups[] , Client *member , int group_id)
     }
     
     int fd = member->fd;
-    
-    //Client *temp = group->members[group->members_count];
 
     for (size_t i = 0; i < group->members_count; i++)
     {
@@ -823,25 +981,39 @@ int leave_group(Group groups[] , Client *member , int group_id)
             }       
 
         }       
-    }         
-    //pfds[i] = pfds[*fd_count-1];
-
-    //(*fd_count)--;
+    }
+    return 1;         
 }
 
-void group_info(Group groups[] , int group_id)
+
+//get a group's info
+int group_info(Group groups[] , int group_id , unsigned char buffer[])
 {
     Group *group = find_group(groups , group_id);
-
-    printf("GROUP NAME: %s\n" , group->group_name);
-    printf("Members:\n");
+    int cursor = 0;
+    if (group == NULL)
+    {
+        return -1;
+    }
+    
+    strcpy(buffer + cursor , "GROUP NAME: ");
+    cursor += strlen("GROUP NAME: ");
+    cursor += sprintf(buffer+cursor, "%s - ", group->group_name);
+    cursor += sprintf(buffer+cursor, "%s\n", group->owner->user_name);
+    strcpy(buffer + cursor , "Members: \n");
+    cursor += strlen("Members: \n");
+    //printf("Members:\n");
 
     for (size_t i = 0; i < group->members_count; i++)
     {
-        printf("   %s\n" , group->members[i]->user_name);
+        cursor += sprintf(buffer+cursor, "%s\n", group->members[i]->user_name);
     }
+    buffer[cursor] = '\0';
+
+    return cursor;
 }
 
+//get all groups
 int get_all_groups(Group groups[] , unsigned char buffer[])
 {
 
@@ -861,7 +1033,6 @@ int get_all_groups(Group groups[] , unsigned char buffer[])
             cursor += num;
             buffer[cursor++] = '\n';           
 
-            //cursor++;
             if (groups[i].next_group != NULL)
             {
                 Group *temp = groups[i].next_group;              

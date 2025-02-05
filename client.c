@@ -8,9 +8,12 @@
 #include <pthread.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <signal.h>
 
 #define default_server_ip "127.0.0.1"
 #define default_server_port "9813"
+
+#define MAX_CLIENT_NAME 45
 
 
 enum MSG_TYPE{   
@@ -27,11 +30,11 @@ enum MSG_TYPE{
     CHAT_LEAVE,
     CLIENT_JOINED_GROUPS,
     CLIENT_OWNED_GROUPS,
-    SERVER_MSG
+    SERVER_MSG,
+    GROUP_INFO,
+    EXIT,
+    NOT_FOUND
 };
-
-//const char commands[][13] = {"JOIN" , "CREATE" , "CHANGE_NAME" , "JOIN" "LEAVE" ,"CREATE" };
-//const cmd_count = 5;
 
 
 //function declarations
@@ -42,8 +45,19 @@ int deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[] , char s
 
 void check_cmd(enum MSG_TYPE *type , char msg[]);
 
+
+volatile sig_atomic_t running = 1; 
+
+void handle_signal(int sig) 
+{
+    running = 0;
+}
+
 int main(int argc , char *argv[])
 {
+
+    //when ctrl+c is detected it calls handle_signal;
+    signal(SIGINT, handle_signal);
     
     pthread_t t1;
     int server_sockfd; 
@@ -57,31 +71,19 @@ int main(int argc , char *argv[])
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    //alocate enough for the server ip and '\0'    
+
     char* server_ip = malloc(INET_ADDRSTRLEN);
     char* server_port = malloc(INET_ADDRSTRLEN);    
 
 
-    printf("Server IP: ");
-    fgets(server_ip, INET_ADDRSTRLEN, stdin);
-    printf("Server Port: ");
-    fgets(server_port, INET_ADDRSTRLEN, stdin);
-    if (strlen(server_ip) < 2)
-    {
-        server_ip = default_server_ip;     
-    }
-    if (strlen(server_port) < 2)
-    {
-        server_port = default_server_port;
-    }
     
     
-    printf("Trying to get address info for %s:%s...\n" , server_ip , server_port);
+    printf("Trying to get address info for %s:%s...\n" , default_server_ip , default_server_port);
     
     
    
     if(getaddrinfo(default_server_ip, default_server_port, &hints, &servinfo) != 0){
-        printf("[ERROR] couldn't get address info for %s:%s\n" , server_ip , server_port);
+        printf("[ERROR] couldn't get address info for %s:%s\n" , default_server_ip , default_server_ip);
         return 1;
     }
  
@@ -103,56 +105,71 @@ int main(int argc , char *argv[])
     //free servinfo struct because we dont need it anymore
     freeaddrinfo(servinfo);
   
-    //create second thread for recviving data
+    //create second thread for receiving data
     pthread_create(&t1 , NULL , &recv_thread , &server_sockfd);
 
     //buffers 
-
     unsigned char s_buffer[256];
-    //unsigned char r_buffer[256];
 
     //msg[] array for user input
     char msg[150];
     printf("Type user name:\n");
     fgets(msg, sizeof(msg), stdin);
     msg[strcspn(msg, "\n")] = '\0';
-    buffer_size = serialize_msg(s_buffer , REG , msg);  
+
+
+    buffer_size = serialize_msg(s_buffer , REG , msg); 
+
     sbytes = send(server_sockfd , s_buffer , buffer_size , 0);  
 
     enum MSG_TYPE type = 0;
 
-    while(1)
-    {        
+    while(running == 1)
+    {   
+        //read user input     
         fgets(msg, sizeof(msg), stdin);      
-        msg[strcspn(msg, "\n")] = '\0';
+        msg[strcspn(msg, "\n")] = '\0';      
 
+        //if user input starts with ! check for command , if no command has been found sets msg_type to NOT_FOUND
         if (msg[0] == '!')
         {
-            //printf("in checking\n");
             check_cmd(&type , msg);
+            if (type == EXIT)
+            {
+                running = 0;
+                break;
+            }
+
         }
         else{
             type = MSG;
         }
-        //printf("%s\n" , msg);
         
         buffer_size = serialize_msg(s_buffer , type , msg);
-        /*for (size_t i = 0; i < buffer_size; i++)
+
+        if (type != NOT_FOUND)
         {
-            printf("0x%02X\n" , s_buffer[i]);
-        }*/
+           sbytes = send(server_sockfd , s_buffer , buffer_size , 0);
+        }
         
-        sbytes = send(server_sockfd , s_buffer , buffer_size , 0);
+
+        //resets the s_buffer with \0
         memset(s_buffer , '\0' , sizeof(s_buffer));
     }
 
-    //close(sockfd);
+    //wait for recv thread to finish
+    pthread_join(t1 ,NULL);
+    printf("Shuting down client\n");
+
+    close(server_sockfd);
 
     return 0;
 }
 
-int serialize_msg(unsigned char *buffer , enum MSG_TYPE msg_type, char msg[]){
-    //4bytes for type , 4bytes for len , msg rest
+
+//serializes the msg - 4bytes for type , 4bytes for msg len , the rest is the msg
+int serialize_msg(unsigned char *buffer , enum MSG_TYPE msg_type, char msg[])
+{
 
     int cursor = 0;
     int msg_len = strlen(msg);
@@ -168,9 +185,9 @@ int serialize_msg(unsigned char *buffer , enum MSG_TYPE msg_type, char msg[]){
 
 }
 
+//deserializes the msg recvieved by the server
 int deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[] , char sender[] , int *sender_lenght , enum MSG_TYPE *server_response_type)
 {
-    //to do - empty buffers
     int cursor = 0;
 
     enum MSG_TYPE msg_type = 0;
@@ -193,6 +210,8 @@ int deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[] , char s
 
 }
 
+
+//checks for command and reformats the msg
 void check_cmd(enum MSG_TYPE *type , char msg[])
 {
     char cmd[13];
@@ -201,12 +220,11 @@ void check_cmd(enum MSG_TYPE *type , char msg[])
     cmd[cmd_len] = '\0';
 
     if (strcmp(cmd , "CREATE") == 0)
-    {
-        
+    {      
         *type = CREATE_GROUP;
         memset(msg , '\0' , cmd_len);
         strcpy(msg , &msg[cmd_len + 2]);
-        //msg[cmd_len] = '\0';       
+        msg[cmd_len] = '\0';       
     }
     else if (strcmp(cmd , "JOIN") == 0)
     {
@@ -224,14 +242,6 @@ void check_cmd(enum MSG_TYPE *type , char msg[])
         msg[cmd_len] = '\0';
         
     }
-    else if (strcmp(cmd , "CHANGE") == 0)
-    {
-        *type = CHANGE_NAME;
-        memset(msg , '\0' , cmd_len);
-        strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
-        
-    }
     else if(strcmp(cmd , "REMOVE") == 0){
         *type = REMOVE_GROUP;
         memset(msg , '\0' , cmd_len);
@@ -240,6 +250,12 @@ void check_cmd(enum MSG_TYPE *type , char msg[])
     }
     else if(strcmp(cmd , "CHAT") == 0){
         *type = CHAT_JOIN;
+        memset(msg , '\0' , cmd_len);
+        strcpy(msg , &msg[cmd_len + 2]);
+        msg[cmd_len] = '\0';
+    }
+    else if(strcmp(cmd , "CHATL") == 0){
+        *type = CHAT_LEAVE;
         memset(msg , '\0' , cmd_len);
         strcpy(msg , &msg[cmd_len + 2]);
         msg[cmd_len] = '\0';
@@ -262,6 +278,22 @@ void check_cmd(enum MSG_TYPE *type , char msg[])
         strcpy(msg , &msg[cmd_len + 2]);
         msg[cmd_len] = '\0';
     }
+    else if(strcmp(cmd , "INFO") == 0){
+        *type = GROUP_INFO;
+        memset(msg , '\0' , cmd_len);
+        strcpy(msg , &msg[cmd_len + 2]);
+        msg[cmd_len] = '\0';
+    }
+    else if(strcmp(cmd , "EXIT") == 0){
+        *type = EXIT;
+        memset(msg , '\0' , cmd_len);
+        strcpy(msg , &msg[cmd_len + 2]);
+        msg[cmd_len] = '\0';
+    }
+    else{
+        *type = NOT_FOUND;
+    }
+    
     
 
 
@@ -275,15 +307,22 @@ void* recv_thread(void* arg){
     
     unsigned char s_buffer[256];
     unsigned char r_buffer[256];
-    char sender[11];
+    char sender[MAX_CLIENT_NAME];
     int sender_len = 0;
     int msg_len = 0;
     enum MSG_TYPE msg_type = MSG;
 
 
-    while(1)
+    while(running == 1)
     {
         int numbytes = recv(sockfd, r_buffer, 100-1, 0);
+        if (numbytes <= 0)
+        {
+            printf("Connection closed by server\n");
+            running = 0;
+            break;
+        }
+        
                 
         msg_len = deserialize_msg(r_buffer , s_buffer , sender , &sender_len , &msg_type);
         if (msg_type != SERVER_MSG)
