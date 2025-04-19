@@ -213,7 +213,6 @@ int main(int argc , char *argv[])
                     rbytes = recv(pfds[i].fd, r_buffer, sizeof(r_buffer), 0);
                                                     
                     int sender_fd = pfds[i].fd;
-                    printf("%d\n" , rbytes);
 
                     if (rbytes <= 0) {
                         //if received bytes is <= 0 , it means that a client has disconected
@@ -222,14 +221,15 @@ int main(int argc , char *argv[])
                         close(sender_client->fd);  
                         //find the client in the hash table and clean after him . (leave groups he is in , remove groups he is a owner to)
 
-                        for (size_t v = sender_client->joined_groups_count; v > 0; v--)
+                        for (size_t v = 0; v < sender_client->joined_groups_count; v++)
                         {
-                            leave_group(groups_table , sender_client ,sender_client->joined_groups[v - 1] , &result);
+                            leave_group(groups_table , sender_client , sender_client->joined_groups[v]->id , &result);
                         }
+                        
 
-                        for (size_t o = sender_client->owned_groups_count; o > 0; o--)
+                        for (size_t o = 0; o < sender_client->owned_groups_count; o++)
                         {
-                           remove_group(groups_table , sender_client->owned_groups[o - 1] , sender_client->fd);
+                           remove_group(groups_table , sender_client->owned_groups[o]->id , sender_client->fd);
                         }                     
                         
 
