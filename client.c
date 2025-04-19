@@ -46,18 +46,11 @@ int deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[] , char s
 void check_cmd(enum MSG_TYPE *type , char msg[]);
 
 
-volatile sig_atomic_t running = 1; 
-
-void handle_signal(int sig) 
-{
-    running = 0;
-}
 
 int main(int argc , char *argv[])
 {
 
-    //when ctrl+c is detected it calls handle_signal;
-    signal(SIGINT, handle_signal);
+   
     
     pthread_t t1;
     int server_sockfd; 
@@ -124,8 +117,8 @@ int main(int argc , char *argv[])
 
     enum MSG_TYPE type = 0;
 
-    while(running == 1)
-    {   
+    while(1)
+    {  
         //read user input     
         fgets(msg, sizeof(msg), stdin);      
         msg[strcspn(msg, "\n")] = '\0';      
@@ -136,7 +129,6 @@ int main(int argc , char *argv[])
             check_cmd(&type , msg);
             if (type == EXIT)
             {
-                running = 0;
                 break;
             }
 
@@ -157,11 +149,16 @@ int main(int argc , char *argv[])
         memset(s_buffer , '\0' , sizeof(s_buffer));
     }
 
+    //shutdown read and write for the socket so recv thread can exit
+    shutdown(server_sockfd , SHUT_RDWR);
+    //close the socket
+    close(server_sockfd);
+
     //wait for recv thread to finish
     pthread_join(t1 ,NULL);
     printf("Shuting down client\n");
 
-    close(server_sockfd);
+    //close(server_sockfd);
 
     return 0;
 }
@@ -206,6 +203,7 @@ int deserialize_msg(unsigned char r_buffer[] , unsigned char s_buffer[] , char s
   
     (*sender_lenght) = sender_len;
     (*server_response_type) = msg_type;
+    s_buffer[msg_len] = '\0';
     return msg_len;
 
 }
@@ -216,79 +214,80 @@ void check_cmd(enum MSG_TYPE *type , char msg[])
 {
     char cmd[13];
     int cmd_len = strcspn(msg + 1, " ");
+    int payload_len = strlen(msg) - cmd_len;
     strncpy(cmd , &msg[1] , cmd_len);
     cmd[cmd_len] = '\0';
 
     if (strcmp(cmd , "CREATE") == 0)
     {      
-        *type = CREATE_GROUP;
-        memset(msg , '\0' , cmd_len);
+        *type = CREATE_GROUP;       
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';       
+        msg[payload_len] = '\0';    
     }
     else if (strcmp(cmd , "JOIN") == 0)
     {
         *type = JOIN_GROUP;
-        memset(msg , '\0' , cmd_len);
+        
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
+
         
     }
     else if (strcmp(cmd , "GROUPS") == 0)
     {
         *type = GROUP_QUERY;
-        memset(msg , '\0' , cmd_len);
+
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
         
     }
     else if(strcmp(cmd , "REMOVE") == 0){
         *type = REMOVE_GROUP;
-        memset(msg , '\0' , cmd_len);
+
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else if(strcmp(cmd , "CHAT") == 0){
         *type = CHAT_JOIN;
-        memset(msg , '\0' , cmd_len);
+
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else if(strcmp(cmd , "CHATL") == 0){
         *type = CHAT_LEAVE;
-        memset(msg , '\0' , cmd_len);
+
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else if(strcmp(cmd , "LEAVE") == 0){
         *type = LEAVE_GROUP;
-        memset(msg , '\0' , cmd_len);
+
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else if(strcmp(cmd , "OWNED") == 0){
         *type = CLIENT_OWNED_GROUPS;
-        memset(msg , '\0' , cmd_len);
+       
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else if(strcmp(cmd , "JOINED") == 0){
         *type = CLIENT_JOINED_GROUPS;
-        memset(msg , '\0' , cmd_len);
+        
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else if(strcmp(cmd , "INFO") == 0){
         *type = GROUP_INFO;
-        memset(msg , '\0' , cmd_len);
+       
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else if(strcmp(cmd , "EXIT") == 0){
         *type = EXIT;
-        memset(msg , '\0' , cmd_len);
+        
         strcpy(msg , &msg[cmd_len + 2]);
-        msg[cmd_len] = '\0';
+        msg[payload_len] = '\0';    
     }
     else{
         *type = NOT_FOUND;
@@ -313,17 +312,15 @@ void* recv_thread(void* arg){
     enum MSG_TYPE msg_type = MSG;
 
 
-    while(running == 1)
+    while(1)
     {
         int numbytes = recv(sockfd, r_buffer, 100-1, 0);
         if (numbytes <= 0)
         {
-            printf("Connection closed by server\n");
-            running = 0;
             break;
         }
         
-                
+          
         msg_len = deserialize_msg(r_buffer , s_buffer , sender , &sender_len , &msg_type);
         if (msg_type != SERVER_MSG)
         {
@@ -332,11 +329,13 @@ void* recv_thread(void* arg){
         }
         else
         {
-            printf("%.*s\n" , msg_len, s_buffer); 
+            printf("%.*s" , msg_len, s_buffer); 
         }
         
                      
         
     }
+
+    return NULL;
 }
 
